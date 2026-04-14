@@ -54,6 +54,7 @@ class CustomerServiceRAG:
         llm_model: str = DEFAULT_LLM_MODEL,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         persist_directory: str = "./data/chroma_db",
+        collection_name: str = "customer_service_kb",
         temperature: float = 0.7,
         top_k: int = 3,
     ):
@@ -65,6 +66,7 @@ class CustomerServiceRAG:
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.persist_directory = persist_directory
+        self.collection_name = collection_name
         self.temperature = temperature
         self.top_k = top_k
 
@@ -195,7 +197,7 @@ class CustomerServiceRAG:
                 documents=documents,
                 embedding=embeddings,
                 persist_directory=self.persist_directory,
-                collection_name="customer_service_kb",
+                collection_name=self.collection_name,
             )
             self._mode = "online"
             _safe_print(f"  [OK] 在线知识库构建完成，已保存至 {self.persist_directory}")
@@ -216,7 +218,7 @@ class CustomerServiceRAG:
             self._vectorstore = Chroma(
                 persist_directory=self.persist_directory,
                 embedding_function=embeddings,
-                collection_name="customer_service_kb",
+                collection_name=self.collection_name,
             )
             self._mode = "online"
             _safe_print(f"  [OK] 知识库已从 {self.persist_directory} 加载")
