@@ -1,0 +1,21 @@
+[Unit]
+Description=AIX AI Customer Service Demo (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aix
+EnvironmentFile=/etc/aix-demo.env
+ExecStart=/opt/aix/.venv/bin/uvicorn src.api_server:app --host 0.0.0.0 --port ${PORT}
+Restart=always
+RestartSec=2
+
+# Basic hardening (safe defaults for most boards)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
