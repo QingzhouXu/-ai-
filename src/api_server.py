@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,45 +62,6 @@ class QueryResponse(BaseModel):
     mode: str
 
 
-class RegisterRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=120)
-    password: str = Field(min_length=6, max_length=128)
-    merchant_slug: Optional[str] = Field(default=None, max_length=40)
-    merchant_name: str = Field(default="我的店铺", min_length=1, max_length=50)
-    personality: str = Field(default="热情专业", min_length=1, max_length=100)
-
-
-class LoginRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=120)
-    password: str = Field(min_length=6, max_length=128)
-
-
-class IngestChatRequest(BaseModel):
-    """
-    从“聊天记录文本”提取问答对并构建知识库。
-
-    chat_text 支持简单格式（每行一条）：
-    - 客户: ...
-    - 商家: ...
-    - 客服: ...
-    也支持在上一条消息后续行继续补充内容（会自动拼接）。
-    """
-
-    chat_text: str = Field(min_length=1)
-    persist_directory: str = DEFAULT_CHROMA_DIR
-    llm_model: Optional[str] = None
-    embedding_model: Optional[str] = None
-    temperature: Optional[float] = None
-    top_k: Optional[int] = None
-
-
-def _slugify(value: str) -> str:
-    value = value.strip().lower()
-    value = re.sub(r"[^a-z0-9\-_.]+", "-", value)
-    value = re.sub(r"-{2,}", "-", value).strip("-")
-    return value[:40] or "merchant"
-
-
 def _load_qa_pairs_from_path(path_str: str) -> List[Dict[str, Any]]:
     path = Path(path_str)
     if not path.exists():
@@ -126,6 +85,138 @@ def _create_rag(persist_directory: str, overrides: IngestRequest) -> CustomerSer
         temperature=overrides.temperature if overrides.temperature is not None else 0.7,
         top_k=overrides.top_k if overrides.top_k is not None else 3,
     )
+
+
+def _create_rag_from_chat_overrides(
+    persist_directory: str, overrides: IngestChatRequest
+) -> CustomerServiceRAG:
+    return CustomerServiceRAG(
+        api_key=os.getenv("ZHIPUAI_API_KEY") or os.getenv("ZHIPU_API_KEY"),
+        persist_directory=persist_directory,
+        llm_model=overrides.llm_model or "glm-4",
+        embedding_model=overrides.embedding_model or "embedding-3",
+        temperature=overrides.temperature if overrides.temperature is not None else 0.7,
+        top_k=overrides.top_k if overrides.top_k is not None else 3,
+    )
+
+
+def _parse_chat_text(chat_text: str) -> List[Dict[str, str]]:
+    """
+    将聊天记录文本解析成 chat_records（role/content）。
+
+    约定：
+    - 以“客户/买家/user/u”开头 -> customer
+    - 以“商家/店家/客服/seller/assistant”开头 -> merchant
+    - 其它行：尝试自动识别角色；否则当作上一条消息的续写
+    """
+
+    def normalize_prefix(prefix: str) -> str:
+        return prefix.strip().lower()
+
+    customer_prefixes = {"客户", "买家", "user", "u", "customer"}
+    merchant_prefixes = {"商家", "店家", "客服", "seller", "assistant", "merchant"}
+    customer_name_markers = ("客户", "买家")
+    merchant_name_markers = ("客服", "店", "商家", "售后", "官方")
+
+    def _strip_leading_timestamp(text: str) -> str:
+        # 兼容：2026-01-01 12:30:00 客户：...
+        # 兼容：[12:30] 客服：...
+        t = text.strip()
+        for pattern in (
+            r"^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*",
+            r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*",
+        ):
+            t = re.sub(pattern, "", t)
+        return t.strip()
+
+    def _guess_role_by_text(text: str) -> Optional[str]:
+        """
+        在没有明确角色前缀时，用启发式猜测 role。
+        目标：宁可返回 None（交给续写/后续逻辑），也不要乱猜。
+        """
+        t = text.strip()
+        if not t:
+            return None
+
+        # 问句更像客户
+        customer_markers = ("？", "?", "吗", "么", "咋", "怎么", "如何", "能不能", "可以吗", "多少钱", "有货吗")
+        if any(m in t for m in customer_markers):
+            return "customer"
+
+        # 典型客服话术更像商家/客服
+        merchant_markers = (
+            "亲",
+            "您好",
+            "这边",
+            "可以的",
+            "支持",
+            "发货",
+            "物流",
+            "运费",
+            "退换",
+            "退款",
+            "售后",
+            "麻烦您",
+            "请您",
+            "我们店",
+            "咱们",
+        )
+        if any(m in t for m in merchant_markers):
+            return "merchant"
+
+        # 句子很短且像回复语气，也偏 merchant，但不强判
+        if len(t) <= 6 and t in {"好的", "可以", "可以的", "收到", "明白", "行", "没问题"}:
+            return "merchant"
+
+        return None
+
+    records: List[Dict[str, str]] = []
+    for raw_line in chat_text.splitlines():
+        line = _strip_leading_timestamp(raw_line)
+        if not line:
+            continue
+
+        # 支持 "角色: 内容" 或 "角色：内容"（角色既可以是固定前缀，也可以是昵称）
+        role = None
+        content = None
+        for sep in (":", "："):
+            if sep in line:
+                left, right = line.split(sep, 1)
+                maybe = normalize_prefix(left)
+                if maybe in customer_prefixes:
+                    role = "customer"
+                    content = right.strip()
+                elif maybe in merchant_prefixes:
+                    role = "merchant"
+                    content = right.strip()
+                else:
+                    # 昵称判别：昵称里含“客服/店/商家”等关键词 -> merchant；含“客户/买家” -> customer
+                    left_raw = left.strip()
+                    if any(m in left_raw for m in merchant_name_markers):
+                        role = "merchant"
+                        content = right.strip()
+                    elif any(m in left_raw for m in customer_name_markers):
+                        role = "customer"
+                        content = right.strip()
+                break
+
+        if role and content:
+            records.append({"role": role, "content": content})
+            continue
+
+        # 无明确前缀：尝试自动识别
+        guessed = _guess_role_by_text(line)
+        if guessed:
+            records.append({"role": guessed, "content": line})
+            continue
+
+        # 仍无法识别：当作续写拼接到上一条；如果没有上一条，默认 customer
+        if records:
+            records[-1]["content"] = f"{records[-1]['content']} {line}".strip()
+        else:
+            records.append({"role": "customer", "content": line})
+
+    return records
 
 
 def _create_rag_from_chat_overrides(
@@ -681,24 +772,6 @@ MERCHANT_HTML = """<!doctype html>
       await loadStatus();
     }
 
-    async function ingestFromChat() {
-      const chat_text = document.getElementById('chatText').value.trim();
-      if (!chat_text) {
-        document.getElementById('ingestChatResult').textContent = '请先粘贴聊天记录';
-        return;
-      }
-      const response = await fetch(basePath() + '/ingest_chat', {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify({ chat_text })
-      });
-      const data = await response.json();
-      document.getElementById('ingestChatResult').textContent = response.ok
-        ? `已从聊天提取并导入：${data.qa_pairs} 条，模式：${data.mode}`
-        : (data.detail || '导入失败');
-      await loadStatus();
-    }
-
     document.getElementById('configBtn').addEventListener('click', updateConfig);
     document.getElementById('ingestBtn').addEventListener('click', ingestFromPath);
     document.getElementById('ingestChatBtn').addEventListener('click', ingestFromChat);
@@ -1191,68 +1264,12 @@ def tenant_ingest_from_path(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"构建知识库失败：{exc}") from exc
-    finally:
-        conn.close()
 
 
-@app.post("/m/{slug}/ingest_chat")
-def tenant_ingest_chat(
-    slug: str,
-    req: IngestChatRequest,
-    user: CurrentUser = Depends(require_user),
-) -> Dict[str, Any]:
-    conn = get_conn()
-    try:
-        merchant = _require_merchant_owner_enabled(slug, user, conn)
-        chat_records = _parse_chat_text(req.chat_text)
-        processor = ChatDataProcessor()
-        qa_pairs = processor.extract_qa_pairs(chat_records)
-        if not qa_pairs:
-            raise ValueError("未能从聊天记录中提取到有效问答对（需要至少出现“客户→商家/客服”的回复链）")
-
-        result = _build_rag_for_merchant(
-            merchant_id=int(merchant["id"]),
-            merchant_name=str(merchant["name"]),
-            personality=str(merchant["personality"]),
-            qa_pairs=qa_pairs,
-            overrides_chat=req,
-        )
-        conn.execute(
-            "INSERT INTO kb_versions(merchant_id, qa_pairs_count, persist_directory, mode) VALUES (?,?,?,?)",
-            (int(merchant["id"]), int(result["qa_pairs"]), result["persist_directory"], result["mode"]),
-        )
-        conn.commit()
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"从聊天构建知识库失败：{exc}") from exc
-    finally:
-        conn.close()
-
-
-@app.post("/m/{slug}/query", response_model=QueryResponse)
-def tenant_query(slug: str, req: QueryRequest) -> QueryResponse:
-    conn = get_conn()
-    try:
-        merchant = _get_merchant_by_slug(conn, slug)
-        runtime = _load_or_create_runtime(merchant)
-
-        if runtime.rag is None:
-            paths = _tenant_paths(int(merchant["id"]))
-            qa_path = Path(paths["qa_pairs_path"])
-            if qa_path.exists():
-                qa_pairs = json.loads(qa_path.read_text(encoding="utf-8"))
-                _build_rag_for_merchant(
-                    merchant_id=int(merchant["id"]),
-                    merchant_name=runtime.merchant_name,
-                    personality=runtime.personality,
-                    qa_pairs=qa_pairs,
-                )
-                runtime = tenant_cache[int(merchant["id"])]
-
-        if runtime.rag is None:
-            raise HTTPException(status_code=400, detail="该商家知识库未初始化，请先在商家端导入聊天记录")
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest) -> QueryResponse:
+    if state.rag is None:
+        raise HTTPException(status_code=400, detail="RAG 未初始化，请先调用 /ingest 构建或导入知识库")
 
         try:
             result = runtime.rag.query(req.question)
